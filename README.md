@@ -229,8 +229,45 @@ Recommended reading order:
 
 ---
 
+## Project Status & Stability
+
+DWCS is an **experimental prototype** and should not currently be considered production-ready.
+
+The goal of this release is to share the architecture, implementation, and ideas behind the system, gather feedback, and allow others to experiment with or improve it. While the core functionality has been implemented, the project has not undergone the level of testing required for production environments.
+
+### Server Mode
+
+The server-coordinated mode has been tested through local development and integration testing (primarily using local instances during development). It has been sufficient for validating the architecture and implementation, but it **has not been tested in a real production environment or under large-scale workloads**.
+
+Although the implementation is functional, it should be treated as experimental software rather than production infrastructure.
+
+### Peer Mode
+
+The peer-to-peer mode is significantly more experimental.
+
+It demonstrates the intended decentralized synchronization model and has been implemented as a working proof of concept, but it **has not been extensively tested for real-world networking conditions, large peer counts, hostile environments, or long-running deployments**.
+
+Developers interested in using peer mode should expect to evaluate, test, and potentially modify it for their own requirements.
+
+### Expectations
+
+DWCS is released to share an experimental backend architecture—not as a finished networking solution.
+
+If you choose to build on top of it:
+
+* Expect APIs and internal behavior to evolve.
+* Perform your own testing and validation.
+* Benchmark under your expected workloads.
+* Review the implementation before deploying it in production.
+* Contribute improvements if you believe the architecture can be strengthened.
+
+The project is intended to grow through experimentation and community feedback over time.
+
+
 # Acknowledgements
 
 DWCS was originally developed as the networking and synchronization foundation for a future open-world VR project.
 
 The backend has been released independently so that its architecture can be explored, evaluated, and improved outside of that game.
+
+
