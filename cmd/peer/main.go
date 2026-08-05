@@ -23,16 +23,23 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":7000", "TCP address to listen for inbound peer connections")
+	listen := flag.String("listen", ":7000", "address to listen for inbound peer connections")
 	peers := flag.String("peers", "", "comma-separated list of peer addresses to dial")
 	tags := flag.String("tags", "*", "comma-separated tags this peer subscribes to")
 	metricsAddr := flag.String("metrics", "", "HTTP address for /metrics endpoint (empty = disabled)")
 	workInterval := flag.Duration("work", 0, "if set, periodically submit a fake result for testing (e.g. 500ms)")
 	name := flag.String("name", "", "peer display name for logs")
+	transportKind := flag.String("transport", "tcp", "transport to use: tcp, udp, or both")
 	flag.Parse()
 
 	if *name == "" {
 		*name = fmt.Sprintf("p%d", rand.Intn(1000))
+	}
+
+	switch *transportKind {
+	case "tcp", "udp", "both":
+	default:
+		log.Fatalf("invalid -transport %q: must be tcp, udp, or both", *transportKind)
 	}
 
 	mr := metrics.New(*metricsAddr != "")
@@ -55,35 +62,60 @@ func main() {
 	}
 	coord := merge.New(w, mergeFunc)
 
-	mgr := peering.NewManager()
-	g := gossip.New(mgr)
+	tagList := parseTags(*tags)
+	peerAddrs := parsePeerAddrs(*peers)
+
+	var activeMgr peering.PeeringManager
+
+	switch *transportKind {
+	case "tcp":
+		mgr := peering.NewManager()
+		if err := mgr.Listen(*listen); err != nil {
+			log.Fatalf("peer tcp listen: %v", err)
+		}
+		log.Printf("[%s] tcp peer listening on %s", *name, *listen)
+		for _, addr := range peerAddrs {
+			dialPeer(*name, addr, mgr)
+		}
+		activeMgr = mgr
+
+	case "udp":
+		mgr := peering.NewUDPManager()
+		if err := mgr.Listen(*listen); err != nil {
+			log.Fatalf("peer udp listen: %v", err)
+		}
+		log.Printf("[%s] udp peer listening on %s", *name, *listen)
+		for _, addr := range peerAddrs {
+			dialPeer(*name, addr, mgr)
+		}
+		activeMgr = mgr
+
+	case "both":
+		tcpMgr := peering.NewManager()
+		if err := tcpMgr.Listen(*listen); err != nil {
+			log.Fatalf("peer tcp listen: %v", err)
+		}
+		log.Printf("[%s] tcp peer listening on %s", *name, *listen)
+
+		udpMgr := peering.NewUDPManager()
+		if err := udpMgr.Listen(*listen); err != nil {
+			log.Fatalf("peer udp listen: %v", err)
+		}
+		log.Printf("[%s] udp peer listening on %s", *name, *listen)
+
+		for _, addr := range peerAddrs {
+			dialPeer(*name, addr, tcpMgr)
+			dialPeer(*name, addr, udpMgr)
+		}
+		activeMgr = peering.NewFanInManager(tcpMgr, udpMgr)
+	}
+
+	g := gossip.New(activeMgr)
 	g.Start()
 	defer g.Stop()
 
-	tagList := parseTags(*tags)
-	node := peer.New(w, coord, mgr, g, mr, tagList)
+	node := peer.New(w, coord, activeMgr, g, mr, tagList)
 	node.Run()
-
-	if err := mgr.Listen(*listen); err != nil {
-		log.Fatalf("peer: %v", err)
-	}
-	log.Printf("[%s] p2p peer listening on %s (tags=%v)", *name, *listen, tagList)
-
-	if *peers != "" {
-		for _, addr := range strings.Split(*peers, ",") {
-			addr = strings.TrimSpace(addr)
-			if addr == "" {
-				continue
-			}
-			go func(a string) {
-				time.Sleep(500 * time.Millisecond)
-				log.Printf("[%s] dialing peer %s", *name, a)
-				if err := mgr.Dial(a); err != nil {
-					log.Printf("[%s] dial %s failed: %v", *name, a, err)
-				}
-			}(addr)
-		}
-	}
 
 	if *metricsAddr != "" {
 		http.HandleFunc("/metrics", mr.HTTPHandler())
@@ -108,26 +140,51 @@ func main() {
 					TaskID: objID,
 					Data:   data,
 				})
-				mgr.Broadcast(msg)
+				activeMgr.Broadcast(msg)
 				node.SubmitLocalResult(objID, data)
 				log.Printf("[%s] submitted %s = {x:%d, y:%d}", *name, objID, x, y)
 			}
 		}()
 	}
 
-	log.Printf("[%s] dwcs p2p peer started (peers=%d)", *name, mgr.PeerCount())
+	log.Printf("[%s] dwcs p2p peer started (transport=%s, peers=%d)", *name, *transportKind, activeMgr.PeerCount())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	log.Printf("[%s] shutting down...", *name)
-	mgr.Stop()
+	activeMgr.Stop()
 	log.Printf("[%s] bye", *name)
+}
+
+func dialPeer(name, addr string, mgr peering.PeeringManager) {
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[%s] dialing peer %s", name, addr)
+		if err := mgr.Dial(addr); err != nil {
+			log.Printf("[%s] dial %s failed: %v", name, addr, err)
+		}
+	}()
 }
 
 func parseTags(s string) []string {
 	if s == "" || s == "*" {
 		return []string{"*"}
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func parsePeerAddrs(s string) []string {
+	if s == "" {
+		return nil
 	}
 	parts := strings.Split(s, ",")
 	out := make([]string, 0, len(parts))

@@ -9,14 +9,14 @@ import (
 )
 
 type Gossip struct {
-	mgr      *peering.Manager
+	mgr      peering.PeeringManager
 	seenMu   sync.Mutex
 	seen     map[string]time.Time
 	maxAge   time.Duration
 	stopChan chan struct{}
 }
 
-func New(mgr *peering.Manager) *Gossip {
+func New(mgr peering.PeeringManager) *Gossip {
 	return &Gossip{
 		mgr:      mgr,
 		seen:     make(map[string]time.Time),

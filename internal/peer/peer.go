@@ -15,13 +15,13 @@ import (
 type Node struct {
 	world   *world.World
 	coord   *merge.Coordinator
-	mgr     *peering.Manager
+	mgr     peering.PeeringManager
 	gossip  *gossip.Gossip
 	metrics *metrics.Recorder
 	tags    []string
 }
 
-func New(w *world.World, c *merge.Coordinator, mgr *peering.Manager, g *gossip.Gossip, mr *metrics.Recorder, tags []string) *Node {
+func New(w *world.World, c *merge.Coordinator, mgr peering.PeeringManager, g *gossip.Gossip, mr *metrics.Recorder, tags []string) *Node {
 	return &Node{
 		world:   w,
 		coord:   c,

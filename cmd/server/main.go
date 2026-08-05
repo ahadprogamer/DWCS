@@ -21,10 +21,15 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":7000", "TCP listen address")
+	tcpAddr := flag.String("tcp-addr", ":7000", "TCP listen address (empty to disable)")
+	udpAddr := flag.String("udp-addr", "", "UDP listen address (empty to disable)")
 	tick := flag.Duration("tick", 100*time.Millisecond, "world projection tick rate")
 	metricsAddr := flag.String("metrics", "", "HTTP address for /metrics endpoint (empty = disabled)")
 	flag.Parse()
+
+	if *tcpAddr == "" && *udpAddr == "" {
+		log.Fatal("at least one of -tcp-addr or -udp-addr must be set")
+	}
 
 	mr := metrics.New(*metricsAddr != "")
 
@@ -79,20 +84,39 @@ func main() {
 	proj.Start()
 	defer proj.Stop()
 
-	srv := transport.NewServer(*addr, m, disp.Handle)
-	srv.OnConnect(func(sessionID string) {
+	onConnect := func(sessionID string) {
 		mr.SessionConnected(sessionID)
-	})
-	srv.OnDisconnect(func(sessionID string) {
+	}
+	onDisconnect := func(sessionID string) {
 		released := r.ReleaseAll(sessionID)
 		mr.SessionDisconnected(sessionID, len(released))
 		if len(released) > 0 {
 			log.Printf("session %s disconnected: released %d tasks", sessionID, len(released))
 		}
 		proj.ForgetSession(sessionID)
-	})
-	if err := srv.Start(); err != nil {
-		log.Fatalf("server: %v", err)
+	}
+
+	var tcpSrv *transport.Server
+	var udpSrv *transport.UDPServer
+
+	if *tcpAddr != "" {
+		tcpSrv = transport.NewServer(*tcpAddr, m, disp.Handle)
+		tcpSrv.OnConnect(onConnect)
+		tcpSrv.OnDisconnect(onDisconnect)
+		if err := tcpSrv.Start(); err != nil {
+			log.Fatalf("tcp server: %v", err)
+		}
+		log.Printf("dwcs tcp listening on %s", *tcpAddr)
+	}
+
+	if *udpAddr != "" {
+		udpSrv = transport.NewUDPServer(*udpAddr, m, disp.Handle)
+		udpSrv.OnConnect(onConnect)
+		udpSrv.OnDisconnect(onDisconnect)
+		if err := udpSrv.Start(); err != nil {
+			log.Fatalf("udp server: %v", err)
+		}
+		log.Printf("dwcs udp listening on %s", *udpAddr)
 	}
 
 	if *metricsAddr != "" {
@@ -105,14 +129,18 @@ func main() {
 		}()
 	}
 
-	log.Printf("dwcs backend listening on %s (tick=%s, metrics=%s)",
-		*addr, *tick, metricsAddrOrOff(*metricsAddr))
+	log.Printf("dwcs backend started (tick=%s, metrics=%s)", *tick, metricsAddrOrOff(*metricsAddr))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	log.Printf("shutting down...")
-	srv.Stop()
+	if tcpSrv != nil {
+		tcpSrv.Stop()
+	}
+	if udpSrv != nil {
+		udpSrv.Stop()
+	}
 	log.Printf("bye")
 }
 
