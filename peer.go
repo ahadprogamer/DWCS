@@ -1,222 +1,128 @@
-package world
+package peer
 
 import (
 	"encoding/json"
-	"errors"
-	"sync"
-	"time"
+	"log"
+
+	"github.com/dwcs/backend/internal/gossip"
+	"github.com/dwcs/backend/internal/merge"
+	"github.com/dwcs/backend/internal/metrics"
+	"github.com/dwcs/backend/internal/peering"
+	"github.com/dwcs/backend/internal/protocol"
+	"github.com/dwcs/backend/internal/world"
 )
 
-var (
-	ErrObjectNotFound  = errors.New("object not found")
-	ErrVersionConflict = errors.New("version conflict: submitted version is stale")
-)
-
-type Object struct {
-	ID        string
-	Data      json.RawMessage
-	Version   uint64
-	Tags      []string
-	Meta      json.RawMessage
-	UpdatedAt time.Time
+type Node struct {
+	world   *world.World
+	coord   *merge.Coordinator
+	mgr     peering.PeeringManager
+	gossip  *gossip.Gossip
+	metrics *metrics.Recorder
+	tags    []string
 }
 
-type UpdateRequest struct {
-	ObjectID        string
-	Data            json.RawMessage
-	ExpectedVersion uint64
-	Tags            []string
-	Meta            json.RawMessage
-}
-
-type ChangeKind string
-
-const (
-	ChangeCreated ChangeKind = "created"
-	ChangeUpdated ChangeKind = "updated"
-	ChangeDeleted ChangeKind = "deleted"
-)
-
-type ChangeEvent struct {
-	Kind        ChangeKind
-	Object      Object
-	PrevVersion uint64
-}
-
-type ChangeHandler func(event ChangeEvent)
-
-type World struct {
-	mu       sync.RWMutex
-	objects  map[string]*Object
-	handlers []ChangeHandler
-}
-
-func New() *World {
-	return &World{objects: make(map[string]*Object)}
-}
-
-func (w *World) OnChange(h ChangeHandler) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.handlers = append(w.handlers, h)
-}
-
-func (w *World) Get(id string) (Object, error) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	obj, ok := w.objects[id]
-	if !ok {
-		return Object{}, ErrObjectNotFound
+func New(w *world.World, c *merge.Coordinator, mgr peering.PeeringManager, g *gossip.Gossip, mr *metrics.Recorder, tags []string) *Node {
+	return &Node{
+		world:   w,
+		coord:   c,
+		mgr:     mgr,
+		gossip:  g,
+		metrics: mr,
+		tags:    tags,
 	}
-	return cloneObject(obj), nil
 }
 
-func (w *World) List(filterTags []string) []Object {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	tagSet := toSet(filterTags)
-	out := make([]Object, 0, len(w.objects))
-	for _, obj := range w.objects {
-		if len(tagSet) == 0 || tagsIntersect(obj.Tags, tagSet) {
-			out = append(out, cloneObject(obj))
+func (n *Node) Run() {
+	n.world.OnChange(func(evt world.ChangeEvent) {
+		if evt.Kind == world.ChangeCreated || evt.Kind == world.ChangeUpdated {
+			n.metrics.WorldUpdated(evt.Object.ID, evt.PrevVersion, evt.Object.Version)
+			n.gossip.BroadcastExcept(protocol.MsgWorldUpdate, "", protocol.WorldUpdatePayload{
+				Objects: []protocol.ObjectDiff{{
+					ObjectID: evt.Object.ID,
+					Data:     evt.Object.Data,
+					Version:  evt.Object.Version,
+					Meta:     evt.Object.Meta,
+				}},
+			}, "")
+		}
+	})
+
+	go n.eventLoop()
+}
+
+func (n *Node) eventLoop() {
+	for evt := range n.mgr.Events() {
+		switch evt.Kind {
+		case peering.EventPeerConnected:
+			log.Printf("[peer] connected: %s", evt.PeerID)
+		case peering.EventPeerClosed:
+			log.Printf("[peer] closed: %s", evt.PeerID)
+		case peering.EventPeerMessage:
+			n.handlePeerMessage(evt.PeerID, evt.Env)
 		}
 	}
-	return out
 }
 
-func (w *World) Apply(req UpdateRequest) (Object, error) {
-	w.mu.Lock()
-	existing, exists := w.objects[req.ObjectID]
+func (n *Node) handlePeerMessage(fromPeerID string, env protocol.Envelope) {
+	if !n.gossip.ShouldForward(env) {
+		return
+	}
 
-	if req.ExpectedVersion > 0 {
-		if !exists {
-			w.mu.Unlock()
-			return Object{}, ErrObjectNotFound
+	switch env.Type {
+	case protocol.MsgWorldUpdate:
+		n.handleWorldUpdate(fromPeerID, env)
+	case protocol.MsgSubmitResult:
+		n.handleRemoteSubmit(fromPeerID, env)
+	}
+}
+
+func (n *Node) handleWorldUpdate(fromPeerID string, env protocol.Envelope) {
+	var p protocol.WorldUpdatePayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		return
+	}
+	for _, diff := range p.Objects {
+		existing, err := n.world.Get(diff.ObjectID)
+		if err == nil && existing.Version >= diff.Version {
+			continue
 		}
-		if existing.Version != req.ExpectedVersion {
-			w.mu.Unlock()
-			return Object{}, ErrVersionConflict
-		}
-	}
-
-	prevVersion := uint64(0)
-	nextVersion := uint64(1)
-	kind := ChangeCreated
-	if exists {
-		prevVersion = existing.Version
-		nextVersion = existing.Version + 1
-		kind = ChangeUpdated
-	}
-
-	tags := copyTags(req.Tags)
-	if tags == nil && exists {
-		tags = copyTags(existing.Tags)
-	}
-	data := copyBytes(req.Data)
-	if data == nil && exists {
-		data = copyBytes(existing.Data)
-	}
-	meta := copyBytes(req.Meta)
-	if meta == nil && exists {
-		meta = copyBytes(existing.Meta)
-	}
-
-	updated := &Object{
-		ID:        req.ObjectID,
-		Data:      data,
-		Version:   nextVersion,
-		Tags:      tags,
-		Meta:      meta,
-		UpdatedAt: time.Now().UTC(),
-	}
-	w.objects[req.ObjectID] = updated
-	handlers := w.handlers
-	w.mu.Unlock()
-
-	w.fire(ChangeEvent{Kind: kind, Object: *updated, PrevVersion: prevVersion}, handlers)
-	return *updated, nil
-}
-
-func (w *World) Delete(id string) bool {
-	w.mu.Lock()
-	existing, ok := w.objects[id]
-	if !ok {
-		w.mu.Unlock()
-		return false
-	}
-	delete(w.objects, id)
-	handlers := w.handlers
-	w.mu.Unlock()
-
-	w.fire(ChangeEvent{
-		Kind:        ChangeDeleted,
-		Object:      cloneObject(existing),
-		PrevVersion: existing.Version,
-	}, handlers)
-	return true
-}
-
-func (w *World) Snapshot() []Object {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	out := make([]Object, 0, len(w.objects))
-	for _, obj := range w.objects {
-		out = append(out, cloneObject(obj))
-	}
-	return out
-}
-
-func (w *World) fire(evt ChangeEvent, handlers []ChangeHandler) {
-	for _, h := range handlers {
-		func() {
-			defer func() { _ = recover() }()
-			h(evt)
-		}()
+		n.world.Apply(world.UpdateRequest{
+			ObjectID: diff.ObjectID,
+			Data:     diff.Data,
+			Tags:     n.tags,
+			Meta:     diff.Meta,
+		})
+		log.Printf("[peer] applied remote update: object=%s v=%d (from %s)", diff.ObjectID, diff.Version, fromPeerID)
+		n.gossip.BroadcastExcept(protocol.MsgWorldUpdate, env.RequestID, protocol.WorldUpdatePayload{
+			Objects: []protocol.ObjectDiff{diff},
+		}, fromPeerID)
 	}
 }
 
-func cloneObject(o *Object) Object {
-	return Object{
-		ID:        o.ID,
-		Data:      copyBytes(o.Data),
-		Version:   o.Version,
-		Tags:      copyTags(o.Tags),
-		Meta:      copyBytes(o.Meta),
-		UpdatedAt: o.UpdatedAt,
+func (n *Node) handleRemoteSubmit(fromPeerID string, env protocol.Envelope) {
+	var p protocol.SubmitResultPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		return
 	}
+	result := n.coord.Submit(merge.Submission{
+		TaskID:  p.TaskID,
+		OwnerID: fromPeerID,
+		Data:    p.Data,
+		Meta:    p.Meta,
+	})
+	if result.Accepted {
+		n.metrics.TaskCompleted(p.TaskID, fromPeerID)
+	}
+	n.gossip.BroadcastExcept(protocol.MsgSubmitResult, env.RequestID, p, fromPeerID)
 }
 
-func copyTags(in []string) []string {
-	if in == nil {
-		return nil
+func (n *Node) SubmitLocalResult(taskID string, data []byte) {
+	result := n.coord.Submit(merge.Submission{
+		TaskID:  taskID,
+		OwnerID: "local",
+		Data:    data,
+	})
+	if result.Accepted {
+		n.metrics.TaskCompleted(taskID, "local")
 	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
-}
-
-func copyBytes(in []byte) []byte {
-	if in == nil {
-		return nil
-	}
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
-}
-
-func toSet(tags []string) map[string]struct{} {
-	s := make(map[string]struct{}, len(tags))
-	for _, t := range tags {
-		s[t] = struct{}{}
-	}
-	return s
-}
-
-func tagsIntersect(objTags []string, filterSet map[string]struct{}) bool {
-	for _, t := range objTags {
-		if _, ok := filterSet[t]; ok {
-			return true
-		}
-	}
-	return false
 }

@@ -1,198 +1,222 @@
-package main
+package world
 
 import (
 	"encoding/json"
-	"flag"
-	"fmt"
-	"log"
-	"math/rand"
-	"net/http"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
+	"errors"
+	"sync"
 	"time"
-
-	"github.com/dwcs/backend/internal/gossip"
-	"github.com/dwcs/backend/internal/merge"
-	"github.com/dwcs/backend/internal/metrics"
-	"github.com/dwcs/backend/internal/peer"
-	"github.com/dwcs/backend/internal/peering"
-	"github.com/dwcs/backend/internal/protocol"
-	"github.com/dwcs/backend/internal/world"
 )
 
-func main() {
-	listen := flag.String("listen", ":7000", "address to listen for inbound peer connections")
-	peers := flag.String("peers", "", "comma-separated list of peer addresses to dial")
-	tags := flag.String("tags", "*", "comma-separated tags this peer subscribes to")
-	metricsAddr := flag.String("metrics", "", "HTTP address for /metrics endpoint (empty = disabled)")
-	workInterval := flag.Duration("work", 0, "if set, periodically submit a fake result for testing (e.g. 500ms)")
-	name := flag.String("name", "", "peer display name for logs")
-	transportKind := flag.String("transport", "tcp", "transport to use: tcp, udp, or both")
-	flag.Parse()
+var (
+	ErrObjectNotFound  = errors.New("object not found")
+	ErrVersionConflict = errors.New("version conflict: submitted version is stale")
+)
 
-	if *name == "" {
-		*name = fmt.Sprintf("p%d", rand.Intn(1000))
-	}
-
-	switch *transportKind {
-	case "tcp", "udp", "both":
-	default:
-		log.Fatalf("invalid -transport %q: must be tcp, udp, or both", *transportKind)
-	}
-
-	mr := metrics.New(*metricsAddr != "")
-	w := world.New()
-
-	mergeFunc := func(sub merge.Submission) merge.Decision {
-		var p map[string]int
-		if err := json.Unmarshal(sub.Data, &p); err != nil {
-			return merge.Decision{Accept: false, Reason: err.Error()}
-		}
-		data, _ := json.Marshal(p)
-		return merge.Decision{
-			Accept: true,
-			Updates: []world.UpdateRequest{{
-				ObjectID: sub.TaskID,
-				Data:     data,
-				Tags:     []string{"test"},
-			}},
-		}
-	}
-	coord := merge.New(w, mergeFunc)
-
-	tagList := parseTags(*tags)
-	peerAddrs := parsePeerAddrs(*peers)
-
-	var activeMgr peering.PeeringManager
-
-	switch *transportKind {
-	case "tcp":
-		mgr := peering.NewManager()
-		if err := mgr.Listen(*listen); err != nil {
-			log.Fatalf("peer tcp listen: %v", err)
-		}
-		log.Printf("[%s] tcp peer listening on %s", *name, *listen)
-		for _, addr := range peerAddrs {
-			dialPeer(*name, addr, mgr)
-		}
-		activeMgr = mgr
-
-	case "udp":
-		mgr := peering.NewUDPManager()
-		if err := mgr.Listen(*listen); err != nil {
-			log.Fatalf("peer udp listen: %v", err)
-		}
-		log.Printf("[%s] udp peer listening on %s", *name, *listen)
-		for _, addr := range peerAddrs {
-			dialPeer(*name, addr, mgr)
-		}
-		activeMgr = mgr
-
-	case "both":
-		tcpMgr := peering.NewManager()
-		if err := tcpMgr.Listen(*listen); err != nil {
-			log.Fatalf("peer tcp listen: %v", err)
-		}
-		log.Printf("[%s] tcp peer listening on %s", *name, *listen)
-
-		udpMgr := peering.NewUDPManager()
-		if err := udpMgr.Listen(*listen); err != nil {
-			log.Fatalf("peer udp listen: %v", err)
-		}
-		log.Printf("[%s] udp peer listening on %s", *name, *listen)
-
-		for _, addr := range peerAddrs {
-			dialPeer(*name, addr, tcpMgr)
-			dialPeer(*name, addr, udpMgr)
-		}
-		activeMgr = peering.NewFanInManager(tcpMgr, udpMgr)
-	}
-
-	g := gossip.New(activeMgr)
-	g.Start()
-	defer g.Stop()
-
-	node := peer.New(w, coord, activeMgr, g, mr, tagList)
-	node.Run()
-
-	if *metricsAddr != "" {
-		http.HandleFunc("/metrics", mr.HTTPHandler())
-		go func() {
-			log.Printf("[%s] metrics endpoint listening on %s", *name, *metricsAddr)
-			if err := http.ListenAndServe(*metricsAddr, nil); err != nil {
-				log.Printf("[%s] metrics HTTP server error: %v", *name, err)
-			}
-		}()
-	}
-
-	if *workInterval > 0 {
-		go func() {
-			ticker := time.NewTicker(*workInterval)
-			defer ticker.Stop()
-			objID := fmt.Sprintf("obj-%s", *name)
-			for range ticker.C {
-				x := rand.Intn(100)
-				y := rand.Intn(100)
-				data, _ := json.Marshal(map[string]int{"x": x, "y": y})
-				msg, _ := protocol.Encode(protocol.MsgSubmitResult, "", protocol.SubmitResultPayload{
-					TaskID: objID,
-					Data:   data,
-				})
-				activeMgr.Broadcast(msg)
-				node.SubmitLocalResult(objID, data)
-				log.Printf("[%s] submitted %s = {x:%d, y:%d}", *name, objID, x, y)
-			}
-		}()
-	}
-
-	log.Printf("[%s] dwcs p2p peer started (transport=%s, peers=%d)", *name, *transportKind, activeMgr.PeerCount())
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	log.Printf("[%s] shutting down...", *name)
-	activeMgr.Stop()
-	log.Printf("[%s] bye", *name)
+type Object struct {
+	ID        string
+	Data      json.RawMessage
+	Version   uint64
+	Tags      []string
+	Meta      json.RawMessage
+	UpdatedAt time.Time
 }
 
-func dialPeer(name, addr string, mgr peering.PeeringManager) {
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		log.Printf("[%s] dialing peer %s", name, addr)
-		if err := mgr.Dial(addr); err != nil {
-			log.Printf("[%s] dial %s failed: %v", name, addr, err)
-		}
-	}()
+type UpdateRequest struct {
+	ObjectID        string
+	Data            json.RawMessage
+	ExpectedVersion uint64
+	Tags            []string
+	Meta            json.RawMessage
 }
 
-func parseTags(s string) []string {
-	if s == "" || s == "*" {
-		return []string{"*"}
+type ChangeKind string
+
+const (
+	ChangeCreated ChangeKind = "created"
+	ChangeUpdated ChangeKind = "updated"
+	ChangeDeleted ChangeKind = "deleted"
+)
+
+type ChangeEvent struct {
+	Kind        ChangeKind
+	Object      Object
+	PrevVersion uint64
+}
+
+type ChangeHandler func(event ChangeEvent)
+
+type World struct {
+	mu       sync.RWMutex
+	objects  map[string]*Object
+	handlers []ChangeHandler
+}
+
+func New() *World {
+	return &World{objects: make(map[string]*Object)}
+}
+
+func (w *World) OnChange(h ChangeHandler) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.handlers = append(w.handlers, h)
+}
+
+func (w *World) Get(id string) (Object, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	obj, ok := w.objects[id]
+	if !ok {
+		return Object{}, ErrObjectNotFound
 	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+	return cloneObject(obj), nil
+}
+
+func (w *World) List(filterTags []string) []Object {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	tagSet := toSet(filterTags)
+	out := make([]Object, 0, len(w.objects))
+	for _, obj := range w.objects {
+		if len(tagSet) == 0 || tagsIntersect(obj.Tags, tagSet) {
+			out = append(out, cloneObject(obj))
 		}
 	}
 	return out
 }
 
-func parsePeerAddrs(s string) []string {
-	if s == "" {
+func (w *World) Apply(req UpdateRequest) (Object, error) {
+	w.mu.Lock()
+	existing, exists := w.objects[req.ObjectID]
+
+	if req.ExpectedVersion > 0 {
+		if !exists {
+			w.mu.Unlock()
+			return Object{}, ErrObjectNotFound
+		}
+		if existing.Version != req.ExpectedVersion {
+			w.mu.Unlock()
+			return Object{}, ErrVersionConflict
+		}
+	}
+
+	prevVersion := uint64(0)
+	nextVersion := uint64(1)
+	kind := ChangeCreated
+	if exists {
+		prevVersion = existing.Version
+		nextVersion = existing.Version + 1
+		kind = ChangeUpdated
+	}
+
+	tags := copyTags(req.Tags)
+	if tags == nil && exists {
+		tags = copyTags(existing.Tags)
+	}
+	data := copyBytes(req.Data)
+	if data == nil && exists {
+		data = copyBytes(existing.Data)
+	}
+	meta := copyBytes(req.Meta)
+	if meta == nil && exists {
+		meta = copyBytes(existing.Meta)
+	}
+
+	updated := &Object{
+		ID:        req.ObjectID,
+		Data:      data,
+		Version:   nextVersion,
+		Tags:      tags,
+		Meta:      meta,
+		UpdatedAt: time.Now().UTC(),
+	}
+	w.objects[req.ObjectID] = updated
+	handlers := w.handlers
+	w.mu.Unlock()
+
+	w.fire(ChangeEvent{Kind: kind, Object: *updated, PrevVersion: prevVersion}, handlers)
+	return *updated, nil
+}
+
+func (w *World) Delete(id string) bool {
+	w.mu.Lock()
+	existing, ok := w.objects[id]
+	if !ok {
+		w.mu.Unlock()
+		return false
+	}
+	delete(w.objects, id)
+	handlers := w.handlers
+	w.mu.Unlock()
+
+	w.fire(ChangeEvent{
+		Kind:        ChangeDeleted,
+		Object:      cloneObject(existing),
+		PrevVersion: existing.Version,
+	}, handlers)
+	return true
+}
+
+func (w *World) Snapshot() []Object {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]Object, 0, len(w.objects))
+	for _, obj := range w.objects {
+		out = append(out, cloneObject(obj))
+	}
+	return out
+}
+
+func (w *World) fire(evt ChangeEvent, handlers []ChangeHandler) {
+	for _, h := range handlers {
+		func() {
+			defer func() { _ = recover() }()
+			h(evt)
+		}()
+	}
+}
+
+func cloneObject(o *Object) Object {
+	return Object{
+		ID:        o.ID,
+		Data:      copyBytes(o.Data),
+		Version:   o.Version,
+		Tags:      copyTags(o.Tags),
+		Meta:      copyBytes(o.Meta),
+		UpdatedAt: o.UpdatedAt,
+	}
+}
+
+func copyTags(in []string) []string {
+	if in == nil {
 		return nil
 	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func copyBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+func toSet(tags []string) map[string]struct{} {
+	s := make(map[string]struct{}, len(tags))
+	for _, t := range tags {
+		s[t] = struct{}{}
+	}
+	return s
+}
+
+func tagsIntersect(objTags []string, filterSet map[string]struct{}) bool {
+	for _, t := range objTags {
+		if _, ok := filterSet[t]; ok {
+			return true
 		}
 	}
-	return out
+	return false
 }

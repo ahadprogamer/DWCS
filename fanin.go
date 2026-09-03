@@ -1,140 +1,89 @@
-package projector
+package peering
 
 import (
-	"sync"
-	"time"
-
-	"github.com/dwcs/backend/internal/metrics"
-	"github.com/dwcs/backend/internal/protocol"
-	"github.com/dwcs/backend/internal/session"
-	"github.com/dwcs/backend/internal/world"
+        "sync"
 )
 
-type Projector struct {
-	world   *world.World
-	manager *session.Manager
-	rate    time.Duration
-	metrics *metrics.Recorder
-
-	mu       sync.Mutex
-	seen     map[string]map[string]uint64
-	stopChan chan struct{}
-	stopped  bool
+type fanInManager struct {
+        a        PeeringManager
+        b        PeeringManager
+        merged   chan PeerEvent
+        stopOnce sync.Once
+        stopChan chan struct{}
 }
 
-func New(w *world.World, m *session.Manager, rate time.Duration, mr *metrics.Recorder) *Projector {
-	if rate <= 0 {
-		rate = 100 * time.Millisecond
-	}
-	return &Projector{
-		world:    w,
-		manager:  m,
-		rate:     rate,
-		metrics:  mr,
-		seen:     make(map[string]map[string]uint64),
-		stopChan: make(chan struct{}),
-	}
+func NewFanInManager(a, b PeeringManager) PeeringManager {
+        m := &fanInManager{
+                a:        a,
+                b:        b,
+                merged:   make(chan PeerEvent, 2048),
+                stopChan: make(chan struct{}),
+        }
+        go m.fanIn(a.Events())
+        go m.fanIn(b.Events())
+        return m
 }
 
-func (p *Projector) Start() {
-	go p.loop()
+func (m *fanInManager) fanIn(ch <-chan PeerEvent) {
+        for {
+                select {
+                case <-m.stopChan:
+                        return
+                case evt, ok := <-ch:
+                        if !ok {
+                                return
+                        }
+                        select {
+                        case m.merged <- evt:
+                        default:
+                        }
+                }
+        }
 }
 
-func (p *Projector) Stop() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.stopped {
-		return
-	}
-	p.stopped = true
-	close(p.stopChan)
+func (m *fanInManager) Listen(addr string) error {
+        return nil
 }
 
-func (p *Projector) ForgetSession(sessionID string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.seen, sessionID)
+func (m *fanInManager) Dial(addr string) error {
+        errA := m.a.Dial(addr)
+        errB := m.b.Dial(addr)
+        if errA != nil {
+                return errA
+        }
+        return errB
 }
 
-func (p *Projector) loop() {
-	ticker := time.NewTicker(p.rate)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-p.stopChan:
-			return
-		case <-ticker.C:
-			p.tick()
-		}
-	}
+func (m *fanInManager) Broadcast(msg []byte) {
+        m.a.Broadcast(msg)
+        m.b.Broadcast(msg)
 }
 
-func (p *Projector) tick() {
-
-	all := p.world.List(nil)
-
-	deliveredCount := 0
-	objectCount := 0
-	p.manager.Each(func(s *session.Session) {
-		diffs := p.computeDiffs(s, all)
-		if len(diffs) == 0 {
-			return
-		}
-		payload := protocol.WorldUpdatePayload{Objects: diffs}
-		msg, err := protocol.Encode(protocol.MsgWorldUpdate, "", payload)
-		if err != nil {
-			return
-		}
-		if s.Send(msg) == nil {
-			deliveredCount++
-			if objectCount == 0 {
-				objectCount = len(diffs)
-			}
-		}
-	})
-
-	if deliveredCount > 0 && p.metrics.Enabled() {
-		p.metrics.Broadcast(deliveredCount, objectCount)
-	}
+func (m *fanInManager) BroadcastExcept(msg []byte, exceptPeerID string) {
+        m.a.BroadcastExcept(msg, exceptPeerID)
+        m.b.BroadcastExcept(msg, exceptPeerID)
 }
 
-func (p *Projector) computeDiffs(s *session.Session, all []world.Object) []protocol.ObjectDiff {
-	p.mu.Lock()
-	seen, ok := p.seen[s.ID]
-	if !ok {
-		seen = make(map[string]uint64)
-		p.seen[s.ID] = seen
-	}
-	p.mu.Unlock()
-
-	var diffs []protocol.ObjectDiff
-	for _, obj := range all {
-
-		if !sessionMatchesAnyTag(s, obj.Tags) {
-			continue
-		}
-		last := seen[obj.ID]
-		if obj.Version > last {
-			diffs = append(diffs, protocol.ObjectDiff{
-				ObjectID: obj.ID,
-				Data:     obj.Data,
-				Version:  obj.Version,
-				Meta:     obj.Meta,
-			})
-			seen[obj.ID] = obj.Version
-		}
-	}
-	return diffs
+func (m *fanInManager) Events() <-chan PeerEvent {
+        return m.merged
 }
 
-func sessionMatchesAnyTag(s *session.Session, objTags []string) bool {
-	if s.HasTag("*") {
-		return true
-	}
-	for _, t := range objTags {
-		if s.HasTag(t) {
-			return true
-		}
-	}
-	return false
+func (m *fanInManager) PeerCount() int {
+        return m.a.PeerCount() + m.b.PeerCount()
+}
+
+// Addr returns the address of the first underlying manager that is listening.
+func (m *fanInManager) Addr() string {
+        if a := m.a.Addr(); a != "" {
+                return a
+        }
+        return m.b.Addr()
+}
+
+func (m *fanInManager) Stop() {
+        m.stopOnce.Do(func() {
+                close(m.stopChan)
+                m.a.Stop()
+                m.b.Stop()
+        })
 }

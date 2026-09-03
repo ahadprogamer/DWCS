@@ -1,352 +1,297 @@
-package task
+package peering
 
 import (
-	"errors"
-	"sync"
-	"time"
+        "bufio"
+        "context"
+        "encoding/json"
+        "errors"
+        "fmt"
+        "io"
+        "net"
+        "sync"
+        "time"
+
+        "github.com/dwcs/backend/internal/protocol"
 )
 
-var (
-	ErrTaskNotFound      = errors.New("task not found")
-	ErrTaskNotAvailable  = errors.New("task not available: already owned")
-	ErrNotOwner          = errors.New("client does not own this task")
-	ErrTaskAlreadyExists = errors.New("task already registered")
-)
+type Peer struct {
+        ID        string
+        Addr      string
+        conn      net.Conn
+        reader    *bufio.Reader
+        outbox    chan []byte
+        closeOnce sync.Once
+        closed    bool
+        mu        sync.RWMutex
+}
 
-type Status string
+func newPeer(id, addr string, conn net.Conn) *Peer {
+        return &Peer{
+                ID:     id,
+                Addr:   addr,
+                conn:   conn,
+                reader: bufio.NewReader(conn),
+                outbox: make(chan []byte, 256),
+        }
+}
+
+func (p *Peer) Send(msg []byte) error {
+        p.mu.RLock()
+        defer p.mu.RUnlock()
+        if p.closed {
+                return errors.New("peer closed")
+        }
+        select {
+        case p.outbox <- msg:
+        default:
+        }
+        return nil
+}
+
+func (p *Peer) Close() {
+        p.closeOnce.Do(func() {
+                p.mu.Lock()
+                p.closed = true
+                p.mu.Unlock()
+                if p.conn != nil {
+                        p.conn.Close()
+                }
+        })
+}
+
+func (p *Peer) IsClosed() bool {
+        p.mu.RLock()
+        defer p.mu.RUnlock()
+        return p.closed
+}
+
+type PeerEvent struct {
+        Kind   string
+        PeerID string
+        Env    protocol.Envelope
+        Err    error
+}
 
 const (
-	StatusAvailable Status = "available"
-	StatusOwned     Status = "owned"
-	StatusCompleted Status = "completed"
+        EventPeerConnected = "connected"
+        EventPeerMessage   = "message"
+        EventPeerClosed    = "closed"
 )
 
-type Task struct {
-	ID         string
-	Tags       []string
-	Hint       []byte
-	Status     Status
-	OwnerID    string
-	LeaseUntil time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+type Manager struct {
+        mu       sync.RWMutex
+        peers    map[string]*Peer
+        listener net.Listener
+        events   chan PeerEvent
+        stopOnce sync.Once
+        stopChan chan struct{}
+        wg       sync.WaitGroup
 }
 
-type LeaseOptions struct {
-	Duration time.Duration
+func NewManager() *Manager {
+        return &Manager{
+                peers:    make(map[string]*Peer),
+                events:   make(chan PeerEvent, 1024),
+                stopChan: make(chan struct{}),
+        }
 }
 
-const DefaultLeaseDuration = 30 * time.Second
-
-type AcquireResult struct {
-	Task       Task
-	LeaseUntil time.Time
+func (m *Manager) Events() <-chan PeerEvent {
+        return m.events
 }
 
-type LostEvent struct {
-	TaskID  string
-	OwnerID string
-	Reason  string
+func (m *Manager) Listen(addr string) error {
+        ln, err := net.Listen("tcp", addr)
+        if err != nil {
+                return fmt.Errorf("listen %s: %w", addr, err)
+        }
+        m.listener = ln
+        m.wg.Add(1)
+        go m.acceptLoop()
+        return nil
 }
 
-type AvailableEvent struct {
-	TaskID string
-	Tags   []string
-	Hint   []byte
-	Reason string
+// Addr returns the address the manager is listening on, or empty if not started.
+func (m *Manager) Addr() string {
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+        if m.listener == nil {
+                return ""
+        }
+        return m.listener.Addr().String()
 }
 
-type LostHandler func(LostEvent)
-type AvailableHandler func(AvailableEvent)
-
-type Registry struct {
-	mu            sync.RWMutex
-	tasks         map[string]*Task
-	lostHandlers  []LostHandler
-	availHandlers []AvailableHandler
-	done          chan struct{}
-	closed        bool
+func (m *Manager) acceptLoop() {
+        defer m.wg.Done()
+        for {
+                conn, err := m.listener.Accept()
+                if err != nil {
+                        select {
+                        case <-m.stopChan:
+                                return
+                        default:
+                                continue
+                        }
+                }
+                m.wg.Add(1)
+                go m.handleInbound(conn)
+        }
 }
 
-func NewRegistry() *Registry {
-	r := &Registry{
-		tasks: make(map[string]*Task),
-		done:  make(chan struct{}),
-	}
-	go r.leaseWatcher()
-	return r
+func (m *Manager) handleInbound(conn net.Conn) {
+        defer m.wg.Done()
+        peerID := fmt.Sprintf("peer-%d-%d", time.Now().UnixNano(), len(m.peers))
+        p := newPeer(peerID, conn.RemoteAddr().String(), conn)
+        m.addPeer(p)
+        m.emit(PeerEvent{Kind: EventPeerConnected, PeerID: peerID})
+        defer func() {
+                m.removePeer(peerID)
+                m.emit(PeerEvent{Kind: EventPeerClosed, PeerID: peerID})
+        }()
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+        go m.writeLoop(ctx, p)
+        for {
+                line, err := p.reader.ReadBytes('\n')
+                if err != nil {
+                        if errors.Is(err, io.EOF) {
+                                return
+                        }
+                        return
+                }
+                var env protocol.Envelope
+                if err := json.Unmarshal(line, &env); err != nil {
+                        continue
+                }
+                m.emit(PeerEvent{Kind: EventPeerMessage, PeerID: peerID, Env: env})
+        }
 }
 
-func (r *Registry) Close() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return
-	}
-	r.closed = true
-	close(r.done)
+func (m *Manager) Dial(addr string) error {
+        conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+        if err != nil {
+                return fmt.Errorf("dial %s: %w", addr, err)
+        }
+        peerID := fmt.Sprintf("peer-%d-%d", time.Now().UnixNano(), len(m.peers))
+        p := newPeer(peerID, addr, conn)
+        m.addPeer(p)
+        m.emit(PeerEvent{Kind: EventPeerConnected, PeerID: peerID})
+        m.wg.Add(1)
+        go m.handleOutbound(p)
+        return nil
 }
 
-func (r *Registry) OnOwnershipLost(h LostHandler) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.lostHandlers = append(r.lostHandlers, h)
+func (m *Manager) handleOutbound(p *Peer) {
+        defer m.wg.Done()
+        defer func() {
+                m.removePeer(p.ID)
+                m.emit(PeerEvent{Kind: EventPeerClosed, PeerID: p.ID})
+        }()
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+        go m.writeLoop(ctx, p)
+        for {
+                line, err := p.reader.ReadBytes('\n')
+                if err != nil {
+                        return
+                }
+                var env protocol.Envelope
+                if err := json.Unmarshal(line, &env); err != nil {
+                        continue
+                }
+                m.emit(PeerEvent{Kind: EventPeerMessage, PeerID: p.ID, Env: env})
+        }
 }
 
-func (r *Registry) OnAvailable(h AvailableHandler) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.availHandlers = append(r.availHandlers, h)
+func (m *Manager) writeLoop(ctx context.Context, p *Peer) {
+        for {
+                select {
+                case <-ctx.Done():
+                        return
+                case msg, ok := <-p.outbox:
+                        if !ok {
+                                return
+                        }
+                        _ = p.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+                        if _, err := p.conn.Write(msg); err != nil {
+                                return
+                        }
+                        if _, err := p.conn.Write([]byte{'\n'}); err != nil {
+                                return
+                        }
+                }
+        }
 }
 
-func (r *Registry) Register(id string, tags []string, hint []byte) error {
-	r.mu.Lock()
-	if _, ok := r.tasks[id]; ok {
-		r.mu.Unlock()
-		return ErrTaskAlreadyExists
-	}
-	tagsCopy := append([]string(nil), tags...)
-	hintCopy := append([]byte(nil), hint...)
-	r.tasks[id] = &Task{
-		ID:        id,
-		Tags:      tagsCopy,
-		Hint:      hintCopy,
-		Status:    StatusAvailable,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-	}
-	handlers := r.availHandlers
-	r.mu.Unlock()
-
-	r.fireAvailable(AvailableEvent{TaskID: id, Tags: tagsCopy, Hint: hintCopy, Reason: "registered"}, handlers)
-	return nil
+func (m *Manager) addPeer(p *Peer) {
+        m.mu.Lock()
+        m.peers[p.ID] = p
+        m.mu.Unlock()
 }
 
-func (r *Registry) Get(id string) (Task, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	t, ok := r.tasks[id]
-	if !ok {
-		return Task{}, ErrTaskNotFound
-	}
-	return *t, nil
+func (m *Manager) removePeer(id string) {
+        m.mu.Lock()
+        p, ok := m.peers[id]
+        if ok {
+                delete(m.peers, id)
+        }
+        m.mu.Unlock()
+        if ok {
+                p.Close()
+        }
 }
 
-func (r *Registry) ListAvailable(filterTags []string) []Task {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	tagSet := toSet(filterTags)
-	var out []Task
-	for _, t := range r.tasks {
-		if t.Status != StatusAvailable {
-			continue
-		}
-		if len(tagSet) == 0 || tagsIntersect(t.Tags, tagSet) {
-			out = append(out, *t)
-		}
-	}
-	return out
+func (m *Manager) Broadcast(msg []byte) {
+        m.mu.RLock()
+        snap := make([]*Peer, 0, len(m.peers))
+        for _, p := range m.peers {
+                snap = append(snap, p)
+        }
+        m.mu.RUnlock()
+        for _, p := range snap {
+                _ = p.Send(msg)
+        }
 }
 
-func (r *Registry) Acquire(taskID, ownerID string, opts LeaseOptions) (AcquireResult, error) {
-	r.mu.Lock()
-	t, ok := r.tasks[taskID]
-	if !ok {
-		r.mu.Unlock()
-		return AcquireResult{}, ErrTaskNotFound
-	}
-
-	if t.Status == StatusOwned {
-		if !t.LeaseUntil.IsZero() && time.Now().UTC().After(t.LeaseUntil) {
-
-			prevOwner := t.OwnerID
-			t.Status = StatusAvailable
-			t.OwnerID = ""
-			t.LeaseUntil = time.Time{}
-			tagsCopy := append([]string(nil), t.Tags...)
-			hintCopy := append([]byte(nil), t.Hint...)
-			lostHandlers := r.lostHandlers
-			availHandlers := r.availHandlers
-			r.mu.Unlock()
-
-			for _, h := range lostHandlers {
-				h(LostEvent{TaskID: taskID, OwnerID: prevOwner, Reason: "lease_expired"})
-			}
-			r.fireAvailable(AvailableEvent{TaskID: taskID, Tags: tagsCopy, Hint: hintCopy, Reason: "lease_expired"}, availHandlers)
-
-			r.mu.Lock()
-			t = r.tasks[taskID]
-			if t == nil {
-				r.mu.Unlock()
-				return AcquireResult{}, ErrTaskNotFound
-			}
-		} else {
-			r.mu.Unlock()
-			return AcquireResult{}, ErrTaskNotAvailable
-		}
-	}
-
-	dur := opts.Duration
-	if dur <= 0 {
-		dur = DefaultLeaseDuration
-	}
-	t.Status = StatusOwned
-	t.OwnerID = ownerID
-	t.LeaseUntil = time.Now().UTC().Add(dur)
-	t.UpdatedAt = time.Now().UTC()
-	result := AcquireResult{Task: *t, LeaseUntil: t.LeaseUntil}
-	r.mu.Unlock()
-	return result, nil
+func (m *Manager) BroadcastExcept(msg []byte, exceptPeerID string) {
+        m.mu.RLock()
+        snap := make([]*Peer, 0, len(m.peers))
+        for _, p := range m.peers {
+                snap = append(snap, p)
+        }
+        m.mu.RUnlock()
+        for _, p := range snap {
+                if p.ID == exceptPeerID {
+                        continue
+                }
+                _ = p.Send(msg)
+        }
 }
 
-func (r *Registry) Release(taskID, ownerID string) error {
-	r.mu.Lock()
-	t, ok := r.tasks[taskID]
-	if !ok {
-		r.mu.Unlock()
-		return ErrTaskNotFound
-	}
-	if t.OwnerID != ownerID {
-		r.mu.Unlock()
-		return ErrNotOwner
-	}
-	tagsCopy := append([]string(nil), t.Tags...)
-	hintCopy := append([]byte(nil), t.Hint...)
-	t.Status = StatusAvailable
-	t.OwnerID = ""
-	t.LeaseUntil = time.Time{}
-	t.UpdatedAt = time.Now().UTC()
-	handlers := r.availHandlers
-	r.mu.Unlock()
-
-	r.fireAvailable(AvailableEvent{TaskID: taskID, Tags: tagsCopy, Hint: hintCopy, Reason: "released"}, handlers)
-	return nil
+func (m *Manager) PeerCount() int {
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+        return len(m.peers)
 }
 
-func (r *Registry) ReleaseAll(ownerID string) []string {
-	r.mu.Lock()
-	type release struct {
-		id   string
-		tags []string
-		hint []byte
-	}
-	var released []release
-	for _, t := range r.tasks {
-		if t.Status == StatusOwned && t.OwnerID == ownerID {
-			released = append(released, release{
-				id:   t.ID,
-				tags: append([]string(nil), t.Tags...),
-				hint: append([]byte(nil), t.Hint...),
-			})
-			t.Status = StatusAvailable
-			t.OwnerID = ""
-			t.LeaseUntil = time.Time{}
-			t.UpdatedAt = time.Now().UTC()
-		}
-	}
-	availHandlers := r.availHandlers
-	lostHandlers := r.lostHandlers
-	r.mu.Unlock()
-
-	ids := make([]string, len(released))
-	for i, rel := range released {
-		ids[i] = rel.id
-		r.fireAvailable(AvailableEvent{TaskID: rel.id, Tags: rel.tags, Hint: rel.hint, Reason: "disconnected"}, availHandlers)
-		for _, h := range lostHandlers {
-			h(LostEvent{TaskID: rel.id, OwnerID: ownerID, Reason: "disconnected"})
-		}
-	}
-	return ids
+func (m *Manager) emit(evt PeerEvent) {
+        select {
+        case m.events <- evt:
+        default:
+        }
 }
 
-func (r *Registry) MarkCompleted(taskID, ownerID string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	t, ok := r.tasks[taskID]
-	if !ok {
-		return ErrTaskNotFound
-	}
-	if t.OwnerID != ownerID {
-		return ErrNotOwner
-	}
-	t.Status = StatusCompleted
-	t.OwnerID = ""
-	t.LeaseUntil = time.Time{}
-	t.UpdatedAt = time.Now().UTC()
-	return nil
-}
-
-func (r *Registry) leaseWatcher() {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.done:
-			return
-		case <-ticker.C:
-			r.evictExpired()
-		}
-	}
-}
-
-func (r *Registry) evictExpired() {
-	now := time.Now().UTC()
-	type expired struct {
-		id, owner string
-		tags      []string
-		hint      []byte
-	}
-	var expiredTasks []expired
-
-	r.mu.Lock()
-	for _, t := range r.tasks {
-		if t.Status == StatusOwned && !t.LeaseUntil.IsZero() && now.After(t.LeaseUntil) {
-			expiredTasks = append(expiredTasks, expired{
-				id:    t.ID,
-				owner: t.OwnerID,
-				tags:  append([]string(nil), t.Tags...),
-				hint:  append([]byte(nil), t.Hint...),
-			})
-			t.Status = StatusAvailable
-			t.OwnerID = ""
-			t.LeaseUntil = time.Time{}
-			t.UpdatedAt = time.Now().UTC()
-		}
-	}
-	availHandlers := r.availHandlers
-	lostHandlers := r.lostHandlers
-	r.mu.Unlock()
-
-	for _, e := range expiredTasks {
-		for _, h := range lostHandlers {
-			h(LostEvent{TaskID: e.id, OwnerID: e.owner, Reason: "lease_expired"})
-		}
-		r.fireAvailable(AvailableEvent{TaskID: e.id, Tags: e.tags, Hint: e.hint, Reason: "lease_expired"}, availHandlers)
-	}
-}
-
-func (r *Registry) fireAvailable(evt AvailableEvent, handlers []AvailableHandler) {
-	for _, h := range handlers {
-		func() {
-			defer func() { _ = recover() }()
-			h(evt)
-		}()
-	}
-}
-
-func toSet(tags []string) map[string]struct{} {
-	s := make(map[string]struct{}, len(tags))
-	for _, t := range tags {
-		s[t] = struct{}{}
-	}
-	return s
-}
-
-func tagsIntersect(taskTags []string, filterSet map[string]struct{}) bool {
-	for _, t := range taskTags {
-		if _, ok := filterSet[t]; ok {
-			return true
-		}
-	}
-	return false
+func (m *Manager) Stop() {
+        m.stopOnce.Do(func() {
+                close(m.stopChan)
+                if m.listener != nil {
+                        m.listener.Close()
+                }
+        })
+        m.mu.Lock()
+        for _, p := range m.peers {
+                p.Close()
+        }
+        m.mu.Unlock()
+        m.wg.Wait()
 }

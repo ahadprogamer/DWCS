@@ -1,167 +1,176 @@
-package dispatcher
+package session
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
-	"log"
-
-	"github.com/dwcs/backend/internal/merge"
-	"github.com/dwcs/backend/internal/metrics"
-	"github.com/dwcs/backend/internal/protocol"
-	"github.com/dwcs/backend/internal/session"
-	"github.com/dwcs/backend/internal/task"
-	"github.com/dwcs/backend/internal/world"
+	"sync"
+	"time"
 )
 
-type Dispatcher struct {
-	manager  *session.Manager
-	registry *task.Registry
-	coord    *merge.Coordinator
-	world    *world.World
-	metrics  *metrics.Recorder
+var (
+	ErrSessionNotFound = errors.New("session not found")
+	ErrSessionClosed   = errors.New("session is closed")
+)
+
+type Session struct {
+	ID          string
+	ConnectedAt time.Time
+
+	mu     sync.RWMutex
+	tags   map[string]struct{}
+	outbox chan []byte
+	closed bool
 }
 
-func New(m *session.Manager, r *task.Registry, c *merge.Coordinator, w *world.World, mr *metrics.Recorder) *Dispatcher {
-	return &Dispatcher{manager: m, registry: r, coord: c, world: w, metrics: mr}
-}
+const outboxBuffer = 512
 
-func (d *Dispatcher) Handle(sessionID string, env protocol.Envelope) error {
-	sess, err := d.manager.Get(sessionID)
-	if err != nil {
-		return err
+func newSession(id string) *Session {
+	return &Session{
+		ID:          id,
+		ConnectedAt: time.Now().UTC(),
+		tags:        make(map[string]struct{}),
+		outbox:      make(chan []byte, outboxBuffer),
 	}
+}
 
-	switch env.Type {
-	case protocol.MsgAcquireTask:
-		return d.handleAcquire(sess, env)
-	case protocol.MsgReleaseTask:
-		return d.handleRelease(sess, env)
-	case protocol.MsgSubmitResult:
-		return d.handleSubmit(sess, env)
-	case protocol.MsgSubscribe:
-		return d.handleSubscribe(sess, env)
-	case protocol.MsgUnsubscribe:
-		return d.handleUnsubscribe(sess, env)
-	case protocol.MsgPing:
-		return d.handlePing(sess, env)
+func (s *Session) Subscribe(tags []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range tags {
+		s.tags[t] = struct{}{}
+	}
+}
+
+func (s *Session) Unsubscribe(tags []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range tags {
+		delete(s.tags, t)
+	}
+}
+
+func (s *Session) HasTag(tag string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.tags[tag]
+	return ok
+}
+
+func (s *Session) Tags() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.tags))
+	for t := range s.tags {
+		out = append(out, t)
+	}
+	return out
+}
+
+func (s *Session) Send(msg []byte) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrSessionClosed
+	}
+	select {
+	case s.outbox <- msg:
 	default:
-		return d.sendError(sess, env.RequestID, "unknown_type", fmt.Sprintf("unknown message type: %s", env.Type))
-	}
-}
 
-func (d *Dispatcher) handleAcquire(sess *session.Session, env protocol.Envelope) error {
-	var p protocol.AcquireTaskPayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return d.sendError(sess, env.RequestID, "bad_payload", err.Error())
 	}
-	res, err := d.registry.Acquire(p.TaskID, sess.ID, task.LeaseOptions{})
-	if err != nil {
-		failPayload := protocol.TaskAcquiredFailPayload{TaskID: p.TaskID, Reason: err.Error()}
-		msg, _ := protocol.Encode(protocol.MsgTaskAcquiredFail, env.RequestID, failPayload)
-		return sess.Send(msg)
-	}
-	d.metrics.TaskClaimed(p.TaskID, sess.ID, task.DefaultLeaseDuration)
-	okPayload := protocol.TaskAcquiredOKPayload{
-		TaskID:     p.TaskID,
-		LeaseUntil: res.LeaseUntil.Unix(),
-	}
-	msg, _ := protocol.Encode(protocol.MsgTaskAcquiredOK, env.RequestID, okPayload)
-	return sess.Send(msg)
-}
-
-func (d *Dispatcher) handleRelease(sess *session.Session, env protocol.Envelope) error {
-	var p protocol.ReleaseTaskPayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return d.sendError(sess, env.RequestID, "bad_payload", err.Error())
-	}
-	if err := d.registry.Release(p.TaskID, sess.ID); err != nil {
-		return d.sendError(sess, env.RequestID, "release_failed", err.Error())
-	}
-	d.metrics.TaskReleased(p.TaskID, sess.ID)
 	return nil
 }
 
-func (d *Dispatcher) handleSubmit(sess *session.Session, env protocol.Envelope) error {
-	var p protocol.SubmitResultPayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return d.sendError(sess, env.RequestID, "bad_payload", err.Error())
-	}
+func (s *Session) Outbox() <-chan []byte {
+	return s.outbox
+}
 
-	t, err := d.registry.Get(p.TaskID)
-	if err != nil {
-		d.metrics.TaskRejected(p.TaskID, sess.ID, "task not found")
-		return d.rejectResult(sess, env.RequestID, p.TaskID, "task not found")
+func (s *Session) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
 	}
-	if t.OwnerID != sess.ID {
-		d.metrics.TaskRejected(p.TaskID, sess.ID, "not owner")
-		return d.rejectResult(sess, env.RequestID, p.TaskID, "not owner")
-	}
+	s.closed = true
 
-	result := d.coord.Submit(merge.Submission{
-		TaskID:  p.TaskID,
-		OwnerID: sess.ID,
-		Data:    p.Data,
-		Meta:    p.Meta,
+}
+
+func (s *Session) IsClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
+}
+
+type Manager struct {
+	mu       sync.RWMutex
+	sessions map[string]*Session
+}
+
+func NewManager() *Manager {
+	return &Manager{sessions: make(map[string]*Session)}
+}
+
+func (m *Manager) Add(id string) *Session {
+	s := newSession(id)
+	m.mu.Lock()
+	m.sessions[id] = s
+	m.mu.Unlock()
+	return s
+}
+
+func (m *Manager) Get(id string) (*Session, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, ErrSessionNotFound
+	}
+	return s, nil
+}
+
+func (m *Manager) Remove(id string) {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	if ok {
+		delete(m.sessions, id)
+	}
+	m.mu.Unlock()
+	if ok {
+		s.Close()
+	}
+}
+
+func (m *Manager) Each(fn func(*Session)) {
+	m.mu.RLock()
+	snap := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		snap = append(snap, s)
+	}
+	m.mu.RUnlock()
+	for _, s := range snap {
+		fn(s)
+	}
+}
+
+func (m *Manager) Broadcast(tags []string, msg []byte) {
+	m.Each(func(s *Session) {
+		if len(tags) == 0 || sessionMatchesTags(s, tags) {
+			_ = s.Send(msg)
+		}
 	})
+}
 
-	if !result.Accepted {
-		d.metrics.TaskRejected(p.TaskID, sess.ID, result.Reason)
-		return d.rejectResult(sess, env.RequestID, p.TaskID, result.Reason)
-	}
+func (m *Manager) BroadcastAll(msg []byte) { m.Broadcast(nil, msg) }
 
-	for _, r := range result.Applied {
-		if r.Error != nil {
-			log.Printf("dispatcher: partial apply error task=%s object=%s: %v", p.TaskID, r.ObjectID, r.Error)
+func (m *Manager) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions)
+}
+
+func sessionMatchesTags(s *Session, tags []string) bool {
+	for _, t := range tags {
+		if s.HasTag(t) {
+			return true
 		}
 	}
-
-	d.metrics.TaskCompleted(p.TaskID, sess.ID)
-	ackMsg, _ := protocol.Encode(protocol.MsgResultAccepted, env.RequestID, protocol.ResultAcceptedPayload{TaskID: p.TaskID})
-	return sess.Send(ackMsg)
+	return false
 }
-
-func (d *Dispatcher) handleSubscribe(sess *session.Session, env protocol.Envelope) error {
-	var p protocol.SubscribePayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return d.sendError(sess, env.RequestID, "bad_payload", err.Error())
-	}
-	sess.Subscribe(p.Tags)
-
-	available := d.registry.ListAvailable(p.Tags)
-	for _, t := range available {
-		msg, _ := protocol.Encode(protocol.MsgTaskAvailable, "", protocol.TaskAvailablePayload{
-			TaskID: t.ID,
-			Tags:   t.Tags,
-			Hint:   t.Hint,
-		})
-		_ = sess.Send(msg)
-	}
-	return nil
-}
-
-func (d *Dispatcher) handleUnsubscribe(sess *session.Session, env protocol.Envelope) error {
-	var p protocol.SubscribePayload
-	if err := json.Unmarshal(env.Payload, &p); err != nil {
-		return d.sendError(sess, env.RequestID, "bad_payload", err.Error())
-	}
-	sess.Unsubscribe(p.Tags)
-	return nil
-}
-
-func (d *Dispatcher) handlePing(sess *session.Session, env protocol.Envelope) error {
-	msg, _ := protocol.Encode(protocol.MsgPong, env.RequestID, nil)
-	return sess.Send(msg)
-}
-
-func (d *Dispatcher) sendError(sess *session.Session, requestID, code, message string) error {
-	msg, _ := protocol.Encode(protocol.MsgError, requestID, protocol.ErrorPayload{Code: code, Message: message})
-	return sess.Send(msg)
-}
-
-func (d *Dispatcher) rejectResult(sess *session.Session, requestID, taskID, reason string) error {
-	msg, _ := protocol.Encode(protocol.MsgResultRejected, requestID, protocol.ResultRejectedPayload{TaskID: taskID, Reason: reason})
-	return sess.Send(msg)
-}
-
-var ErrUnknownMessageType = errors.New("unknown message type")
